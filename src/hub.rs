@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -258,6 +258,8 @@ pub struct Hub {
     pub hello_extra: Mutex<serde_json::Map<String, serde_json::Value>>,
     /// Screenshot requests, answered by the capture thread with the current screen.
     pub snapshots: Mutex<Vec<tokio::sync::oneshot::Sender<Arc<crate::record::Snapshot>>>>,
+    /// `/wait` requests in flight: they need capture running to see changes.
+    pub waits: AtomicUsize,
     /// When each part of the screen last changed (`/wait`).
     pub activity: crate::wait::Activity,
 }
@@ -280,6 +282,7 @@ impl Hub {
             resize_max: Mutex::new(None),
             hello_extra: Mutex::new(serde_json::Map::new()),
             snapshots: Mutex::new(Vec::new()),
+            waits: AtomicUsize::new(0),
             activity: Default::default(),
         })
     }

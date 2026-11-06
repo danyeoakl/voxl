@@ -136,6 +136,11 @@ impl Activity {
         self.map.lock().last.0
     }
 
+    /// Sequence number of the latest new capture.
+    fn reset_seq(&self) -> u64 {
+        self.map.lock().reset.0
+    }
+
     /// The latest change in `region` (or anywhere) and the latest sequence number,
     /// read together: a `seq` handed out never covers a change the answer didn't see.
     fn latest(&self, region: Option<Rect>) -> (Mark, u64) {
@@ -198,6 +203,8 @@ pub async fn wait(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let start = Instant::now();
+    // Capture runs only while someone wants it, and changes are only seen while it runs.
+    let _demand = Waiting::new(&hub);
     let a = &hub.activity;
     let Some(idle) = millis(&q, "idle", DEFAULT_IDLE) else {
         return bad("idle must be a whole number of milliseconds");
@@ -216,7 +223,8 @@ pub async fn wait(
             None => return bad("region must be x,y,w,h"),
         },
     };
-    let since = match q.get("since") {
+    let implicit = !q.contains_key("since");
+    let mut since = match q.get("since") {
         None => a.seq(),
         Some(v) => match v.parse() {
             Ok(n) => n,
@@ -228,6 +236,12 @@ pub async fn wait(
     let timed_out = loop {
         // Mark the current change seen before looking, so a later one wakes us.
         rx.borrow_and_update();
+        // Capture may only start for this request: a new capture marks everything changed,
+        // which isn't a change since the request. (After a `since`, it counts: what changed
+        // while nothing was capturing can't be known.)
+        if implicit {
+            since = since.max(a.reset_seq());
+        }
         let ((seq, at), _) = a.latest(region);
         let now = Instant::now();
         let done_at = if change {
@@ -257,4 +271,87 @@ pub async fn wait(
             "waited_ms": start.elapsed().as_millis() as u64,
         }),
     )
+}
+
+/// Counts one `/wait` in `Hub::waits` while it lives, so capture runs (and sees changes)
+/// for it, and wakes the capture thread both ways.
+struct Waiting(Arc<Hub>);
+
+impl Waiting {
+    fn new(hub: &Arc<Hub>) -> Self {
+        hub.waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        hub.wake();
+        Waiting(hub.clone())
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0
+            .waits
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.wake();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn answer(hub: &Arc<Hub>, query: &[(&str, &str)]) -> serde_json::Value {
+        let q = query
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let resp = wait(State(hub.clone()), Query(q)).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_capture_starting_for_a_wait_is_not_a_change() {
+        let hub = Hub::new();
+        hub.activity.reset(64, 64);
+        let h = hub.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Capture (re)starts, as when a /wait is what asked for it.
+            h.activity.reset(64, 64);
+        });
+        let a = answer(&hub, &[("change", "1"), ("timeout", "300")]).await;
+        assert_eq!(a["changed"], false, "{a}");
+        assert_eq!(a["timed_out"], true, "{a}");
+    }
+
+    #[tokio::test]
+    async fn a_real_change_still_ends_the_wait() {
+        let hub = Hub::new();
+        hub.activity.reset(64, 64);
+        let h = hub.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            h.activity.reset(64, 64);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            h.activity.note(&[(0, 0, 16, 16)]);
+        });
+        let a = answer(&hub, &[("change", "1"), ("timeout", "2000")]).await;
+        assert_eq!(a["changed"], true, "{a}");
+        assert_eq!(a["timed_out"], false, "{a}");
+    }
+
+    #[tokio::test]
+    async fn after_a_since_a_new_capture_counts_as_changed() {
+        let hub = Hub::new();
+        hub.activity.reset(64, 64);
+        let since = hub.activity.seq().to_string();
+        hub.activity.reset(64, 64);
+        let a = answer(
+            &hub,
+            &[("change", "1"), ("since", &since), ("timeout", "300")],
+        )
+        .await;
+        assert_eq!(a["changed"], true, "{a}");
+    }
 }

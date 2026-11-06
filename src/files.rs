@@ -10,10 +10,30 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Uploads and downloads in flight: a Mac voxl that restarts once nobody watches waits
+/// for them (see video.rs).
+pub static BUSY: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts one transfer in BUSY while it lives.
+struct Busy;
+
+impl Busy {
+    fn new() -> Self {
+        BUSY.fetch_add(1, Ordering::Relaxed);
+        Busy
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 pub struct Files {
     pub root: PathBuf,
@@ -167,6 +187,11 @@ pub async fn download(State(f): State<Arc<Files>>, Query(q): Q) -> Response {
             Err(e) => Some((Err(e), None)),
         }
     });
+    let busy = Busy::new();
+    let stream = stream.map(move |c| {
+        let _ = &busy;
+        c
+    });
     let mut h = attachment(&name, "application/octet-stream");
     h.insert(header::CONTENT_LENGTH, md.len().into());
     (h, Body::from_stream(stream)).into_response()
@@ -214,8 +239,13 @@ fn zip_folder(dir: PathBuf, name: String) -> Response {
             let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
         }
     });
+    let busy = Busy::new();
     let stream =
-        futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|c| (c, rx)) });
+        futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|c| (c, rx)) })
+            .map(move |c| {
+                let _ = &busy;
+                c
+            });
     (
         attachment(&format!("{name}.zip"), "application/zip"),
         Body::from_stream(stream),
@@ -404,6 +434,7 @@ pub async fn upload(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let _busy = Busy::new();
     if !f.upload {
         return err(StatusCode::FORBIDDEN, "uploads are disabled");
     }

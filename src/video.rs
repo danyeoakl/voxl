@@ -73,46 +73,218 @@ pub fn spawn(
     if let Some(s) = &screen {
         *hub.resize_max.lock() = Some(s.max());
     }
-    let mut p = build(&cfg, &hub)?;
+    // Elsewhere, starting capture here checks that it works (it stops again once nobody
+    // wants video). A Mac leaves ScreenCaptureKit alone until a viewer wants video: see
+    // the capture thread.
+    let first = if cfg!(target_os = "macos") {
+        None
+    } else {
+        Some(build(&cfg, &hub)?)
+    };
+    // While a viewer watches, a Mac's display stays awake, as with any remote desktop:
+    // otherwise its sleep timer runs out under someone who is only watching, and wakes
+    // it again when they come back (to the lock screen, if the Mac is locked).
+    #[cfg(target_os = "macos")]
+    {
+        let hub = hub.clone();
+        std::thread::Builder::new()
+            .name("keep-awake".into())
+            .spawn(move || loop {
+                if hub
+                    .clients
+                    .lock()
+                    .iter()
+                    .any(|c| c.video.load(Ordering::Relaxed))
+                {
+                    crate::mac::wake_display();
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            })
+            .unwrap();
+    }
     std::thread::Builder::new()
         .name("capture".into())
-        .spawn(move || loop {
-            let Pipeline {
-                mut cap,
-                job_tx,
-                ret_rx,
-                encode,
-            } = p;
-            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), job_tx, ret_rx) {
-                #[cfg(target_os = "linux")]
-                let resized = cap.geometry_changed();
-                #[cfg(not(target_os = "linux"))]
-                let resized = false;
-                if resized {
-                    log::info!("capture geometry changed: {e}");
+        .spawn(move || {
+            let mut p = first;
+            let mut used = p.is_some();
+            loop {
+                // Capture runs only while someone wants it: an idle capture, or retries on a
+                // display that sleeps, keep the OS's capture service busy for nobody.
+                let Some(Pipeline {
+                    mut cap,
+                    job_tx,
+                    ret_rx,
+                    encode,
+                }) = p.take()
+                else {
+                    // On a Mac, once a stream has stopped, ReplayKit inside this process can
+                    // keep reconnecting to replayd ~1,000 times a second until the process
+                    // exits (~15% of a core here, ~80% in replayd). So a Mac voxl that has
+                    // used ScreenCaptureKit exits when nobody wants video; launchd starts a
+                    // fresh one and the page reconnects on its own.
+                    if used && cfg!(target_os = "macos") {
+                        // Not under a file transfer.
+                        while crate::files::BUSY.load(Ordering::Relaxed) > 0 && !wanted(&hub) {
+                            wait_any(&[hub.waker.waitable()], 1000);
+                            hub.drain_wake();
+                        }
+                        if !wanted(&hub) {
+                            log::info!("nobody wants video: restarting without capture");
+                            std::process::exit(0);
+                        }
+                    }
+                    wait_for_demand(&hub);
+                    used = true;
+                    p = build_when_ready(&cfg, &hub);
+                    continue;
+                };
+                if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), job_tx, ret_rx) {
+                    #[cfg(target_os = "linux")]
+                    let resized = cap.geometry_changed();
+                    #[cfg(not(target_os = "linux"))]
+                    let resized = false;
+                    if resized {
+                        log::info!("capture geometry changed: {e}");
+                    } else if cfg!(target_os = "macos") {
+                        // A Mac's display went to sleep or away: build_when_ready waits
+                        // for it or stops voxl.
+                        log::warn!("capture loop ended: {e}");
+                    } else {
+                        log::error!("capture loop ended: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                drop(cap);
+                let _ = encode.join();
+                let req = hub.resize_req.lock().take();
+                if let (Some(s), Some((w, h))) = (screen.as_mut(), req) {
+                    if let Err(e) = s.resize(w, h) {
+                        log::warn!("resize to {w}x{h} failed: {e}");
+                    }
+                }
+                if wanted(&hub) {
+                    p = build_when_ready(&cfg, &hub);
                 } else {
-                    log::error!("capture loop ended: {e}");
-                    std::process::exit(1);
+                    log::info!("nobody wants video: capture stopped");
                 }
             }
-            drop(cap);
-            let _ = encode.join();
-            let req = hub.resize_req.lock().take();
-            if let (Some(s), Some((w, h))) = (screen.as_mut(), req) {
-                if let Err(e) = s.resize(w, h) {
-                    log::warn!("resize to {w}x{h} failed: {e}");
-                }
-            }
-            p = match build(&cfg, &hub) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::error!("video restart failed: {e}");
-                    std::process::exit(1);
-                }
-            };
         })
         .unwrap();
     Ok(())
+}
+
+/// A capture error only a restart fixes: macOS grants Screen Recording to a process
+/// when it starts, so voxl exits and its supervisor starts it again.
+fn retry_cannot_fix(e: &str) -> bool {
+    e.contains("declined TCC")
+}
+
+/// A Mac whose displays are all asleep: nothing to capture until one wakes, which a
+/// viewer can cause. The one failure worth waiting out in this process.
+fn displays_asleep() -> bool {
+    #[cfg(target_os = "macos")]
+    return !crate::mac::any_display_active();
+    #[cfg(not(target_os = "macos"))]
+    return false;
+}
+
+/// Whether anyone needs the screen captured: a viewer with video on (a tab that is
+/// hidden turns it off) or audio on (so a Mac voxl doesn't restart under someone
+/// listening), a recording, a screenshot waiting for a frame (one that gave up
+/// waiting doesn't count) or a `/wait`.
+fn wanted(hub: &Hub) -> bool {
+    let mut snaps = hub.snapshots.lock();
+    snaps.retain(|tx| !tx.is_closed());
+    !snaps.is_empty()
+        || hub.waits.load(Ordering::Relaxed) > 0
+        || hub
+            .clients
+            .lock()
+            .iter()
+            .any(|c| c.video.load(Ordering::Relaxed) || c.audio.load(Ordering::Relaxed))
+}
+
+/// Sleeps until someone wants video. Joins, video toggles, leaves and screenshot
+/// requests all signal the hub's waker.
+fn wait_for_demand(hub: &Hub) {
+    loop {
+        hub.drain_wake();
+        if wanted(hub) {
+            return;
+        }
+        wait_any(&[hub.waker.waitable()], 5000);
+    }
+}
+
+/// How long capture keeps running after the last viewer leaves, so a page reload or a
+/// tab switched back doesn't restart it.
+const LINGER: Duration = Duration::from_secs(10);
+
+/// Builds the pipeline again. On a Mac whose displays all sleep, waits for one to wake
+/// (the keep-awake thread wakes them while a viewer wants video). Any other failure stops voxl as before (on a
+/// Mac after 30 s, since a display that just woke can take a moment to be capturable), so
+/// its supervisor starts it again and the display is picked afresh. Retries only while
+/// someone wants video: None once nobody does.
+fn build_when_ready(cfg: &VideoConfig, hub: &Arc<Hub>) -> Option<Pipeline> {
+    let grace = std::time::Duration::from_secs(if cfg!(target_os = "macos") { 30 } else { 0 });
+    let mut waiting = false;
+    let mut awake_since: Option<std::time::Instant> = None;
+    loop {
+        let built = {
+            let _turn = capture_turn();
+            build(cfg, hub)
+        };
+        match built {
+            Ok(p) => {
+                if waiting {
+                    log::info!("video is back");
+                }
+                return Some(p);
+            }
+            Err(e) if retry_cannot_fix(&e) => {
+                log::error!("video restart failed: {e}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                if !wanted(hub) {
+                    log::info!("no video ({e}); nobody wants it, so not retrying");
+                    return None;
+                }
+                if displays_asleep() {
+                    awake_since = None;
+                } else if awake_since
+                    .get_or_insert_with(std::time::Instant::now)
+                    .elapsed()
+                    >= grace
+                {
+                    log::error!("video restart failed: {e}");
+                    std::process::exit(1);
+                }
+                if !waiting {
+                    log::warn!("no video ({e}); retrying until the display is back");
+                    waiting = true;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+}
+
+/// One voxl per display on a Mac: ScreenCaptureKit starting in two of them at the same
+/// moment interrupts both, so they take turns, by a lock file every voxl of this user
+/// shares. Held until the new stream has its first frame.
+fn capture_turn() -> Option<std::fs::File> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(std::env::temp_dir().join("voxl-capture.lock"))
+        .ok()?;
+    f.lock().ok()?;
+    Some(f)
 }
 
 fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
@@ -480,6 +652,7 @@ fn capture_loop(
     let mut rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64);
     hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
     let mut had_clients = false;
+    let mut idle_since: Option<Instant> = None;
     let mut full_next = true;
     let mut refiner = Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16));
     let debug_marker = std::env::var("VOXL_DEBUG_MARKER").is_ok();
@@ -523,9 +696,15 @@ fn capture_loop(
                 hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
             }
             had_clients = false;
+            if wanted(&hub) {
+                idle_since = None;
+            } else if idle_since.get_or_insert_with(Instant::now).elapsed() >= LINGER {
+                return Ok(());
+            }
             wait_any(&[cap.fd(), hub.waker.waitable()], 500);
             continue;
         }
+        idle_since = None;
         rc.update(&hub, &clients);
         let want_key = clients
             .iter()

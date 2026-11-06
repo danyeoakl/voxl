@@ -146,6 +146,11 @@ pub fn active_displays() -> Vec<u32> {
     let mut ids = [0u32; 16];
     let mut n = 0u32;
     unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) };
+    // Asleep, displays aren't active; started then (after an update, say), voxl would
+    // fall back to the main display. The online list still has them.
+    if n == 0 {
+        unsafe { CGGetOnlineDisplayList(16, ids.as_mut_ptr(), &mut n) };
+    }
     let mut v = ids[..n as usize].to_vec();
     // Main display first, so index 0 is the main one.
     let main = unsafe { CGMainDisplayID() };
@@ -216,4 +221,31 @@ fn prompt_accessibility() {
         let opts = CFDictionary::from_slices(&[&*key], &[CFBoolean::new(true)]);
         AXIsProcessTrustedWithOptions(&*opts as *const _ as *const std::ffi::c_void);
     }
+}
+
+/// Whether any display is awake (the active list is empty while they all sleep).
+pub fn any_display_active() -> bool {
+    let mut ids = [0u32; 16];
+    let mut n = 0u32;
+    unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) };
+    n > 0
+}
+
+/// Wakes the displays as a key press would (to the lock screen, if the Mac is locked),
+/// so a viewer who connects to a sleeping Mac gets a picture instead of nothing.
+pub fn wake_display() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // Reusing the assertion id renews one assertion instead of piling up new ones.
+    static ID: AtomicU32 = AtomicU32::new(0);
+    let mut id = ID.load(Ordering::Relaxed);
+    unsafe {
+        let name = CFStringCreateWithCString(
+            std::ptr::null(),
+            c"voxl: a viewer is watching".as_ptr(),
+            kCFStringEncodingUTF8,
+        );
+        IOPMAssertionDeclareUserActivity(name, kIOPMUserActiveLocal, &mut id);
+        CFRelease(name);
+    }
+    ID.store(id, Ordering::Relaxed);
 }
